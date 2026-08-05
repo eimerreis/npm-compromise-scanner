@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "incidents": [
+    {
+      "id": "legacy-axios-scan",
+      "packages": [
+        {
+          "name": "axios",
+          "versions": ["1.14.1", "0.30.4"]
+        }
+      ]
+    },
+    {
+      "id": "aikido-shai-hulud-2026-08-04",
+      "published": "2026-08-04",
+      "source": "https://www.aikido.dev/blog/keyv-and-friends-compromised-in-npm-supply-chain-attack",
+      "packages": [
+        { "name": "keyv", "versions": ["6.0.0"] },
+        { "name": "flat-cache", "versions": ["6.1.24"] },
+        { "name": "file-entry-cache", "versions": ["11.1.6"] },
+        { "name": "cacheable-request", "versions": ["13.0.20"] },
+        { "name": "cacheable", "versions": ["2.5.1"] },
+        { "name": "@cacheable/memory", "versions": ["2.2.1"] },
+        { "name": "cache-manager", "versions": ["7.2.10"] },
+        { "name": "@cacheable/node-cache", "versions": ["3.1.2"] },
+        { "name": "@cacheable/utils", "versions": ["2.5.1"] },
+        { "name": "@cacheable/net", "versions": ["2.1.1"] },
+        { "name": "ecto", "versions": ["5.0.1"] },
+        { "name": "@deliveroo/reevent", "versions": ["1.0.1"] },
+        { "name": "@or-sdk/invitations", "versions": ["1.4.9"] },
+        { "name": "@picsart/ai-sdk", "versions": ["3.32.2"] },
+        { "name": "@qlik/embed-runtime", "versions": ["1.6.4"] },
+        { "name": "picasso.js", "versions": ["2.11.6"] }
+      ]
+    }
+  ]
+}
