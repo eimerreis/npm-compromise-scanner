@@ -1,11 +1,13 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { clearCache, defaultCacheFile, readCachedFiles, writeCachedFiles } from './cache.js';
 import { discoverCandidateFiles } from './discovery.js';
 import { loadManifest } from './manifest.js';
 import { scanFiles } from './scanner.js';
-import type { FileScanResult } from './types.js';
+import type { FileScanResult, VulnerabilityManifest } from './types.js';
 
 const packageMetadata: unknown = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 const packageVersion =
@@ -15,19 +17,30 @@ const packageVersion =
   typeof packageMetadata.version === 'string'
     ? packageMetadata.version
     : 'unknown';
-const defaultManifest = fileURLToPath(new URL('../data/compromised-npm-packages.json', import.meta.url));
+const bundledManifest = fileURLToPath(new URL('../data/compromised-npm-packages.json', import.meta.url));
+const workspaceManifestFilename = 'npm-compromise-scanner.json';
 
-type CliOptions = {
+type ScanOptions = {
   root: string;
-  manifest: string;
+  manifest?: string;
   cacheFile: string;
   useCache: boolean;
   clearCache: boolean;
 };
 
+type InitOptions = {
+  output: string;
+  force: boolean;
+  source?: string;
+  packageSpecs: string[];
+};
+
+type PackageEntry = VulnerabilityManifest['incidents'][number]['packages'][number];
+
 export type CliIo = {
   stdout: (message: string) => void;
   stderr: (message: string) => void;
+  prompt?: (message: string) => Promise<string>;
 };
 
 const processIo: CliIo = {
@@ -36,27 +49,33 @@ const processIo: CliIo = {
 };
 
 export async function runCli(argv: string[], io: CliIo = processIo): Promise<number> {
-  let options: CliOptions;
+  let parsed: ReturnType<typeof parseArguments>;
   try {
-    const parsed = parseArguments(argv);
-    if (parsed.action === 'help') {
-      io.stdout(helpText());
-      return 0;
-    }
-    if (parsed.action === 'version') {
-      io.stdout(packageVersion);
-      return 0;
-    }
-    options = parsed.options;
+    parsed = parseArguments(argv);
   } catch (error) {
     io.stderr(`Input error: ${errorMessage(error)}`);
     io.stderr('Run npm-compromise-scan --help for usage.');
     return 2;
   }
 
+  if (parsed.action === 'help') {
+    io.stdout(helpText(parsed.topic));
+    return 0;
+  }
+  if (parsed.action === 'version') {
+    io.stdout(packageVersion);
+    return 0;
+  }
+  if (parsed.action === 'init') return runInit(parsed.options, io);
+
+  return runScan(parsed.options, io);
+}
+
+async function runScan(options: ScanOptions, io: CliIo): Promise<number> {
+  const manifest = options.manifest ?? defaultManifest();
   let pairs;
   try {
-    pairs = await loadManifest(options.manifest);
+    pairs = await loadManifest(manifest);
   } catch (error) {
     io.stderr(`Configuration error: ${errorMessage(error)}`);
     return 2;
@@ -134,6 +153,170 @@ export async function runCli(argv: string[], io: CliIo = processIo): Promise<num
   return 0;
 }
 
+async function runInit(options: InitOptions, io: CliIo): Promise<number> {
+  if (existsSync(options.output) && !options.force) {
+    io.stderr(`Configuration error: ${options.output} already exists. Use init --force to overwrite it.`);
+    return 2;
+  }
+  const terminalPrompt = options.source || io.prompt ? undefined : createTerminalPrompt();
+  const interactiveIo = { prompt: io.prompt ?? terminalPrompt?.prompt };
+
+  try {
+    const source = options.source ?? (await askForSourceUrl(requirePrompt(interactiveIo)));
+    if (!incidentSlug(source)) throw new Error('A source URL with a path slug is required');
+    const packages = options.source ? packagesFromSpecs(options.packageSpecs) : await askForPackages(requirePrompt(interactiveIo));
+    const manifest: VulnerabilityManifest = {
+      schemaVersion: 1,
+      incidents: [
+        {
+          id: `custom-${incidentSlug(source)}`,
+          source,
+          packages,
+        },
+      ],
+    };
+
+    await mkdir(path.dirname(options.output), { recursive: true });
+    await writeFile(options.output, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    io.stdout(`Created workspace manifest: ${options.output}`);
+    io.stdout(`Scan with: npm-compromise-scan --manifest ${options.output}`);
+    return 0;
+  } catch (error) {
+    const signal = terminalPrompt?.interrupted();
+    if (signal) {
+      io.stderr(`Interactive setup cancelled by ${signal}.`);
+      return signal === 'SIGINT' ? 130 : 143;
+    }
+    io.stderr(`Input error: ${errorMessage(error)}`);
+    return 2;
+  } finally {
+    terminalPrompt?.close();
+  }
+}
+
+type TerminalPrompt = {
+  prompt: (message: string) => Promise<string>;
+  close: () => void;
+  interrupted: () => NodeJS.Signals | undefined;
+};
+
+function createTerminalPrompt(): TerminalPrompt {
+  const readline = createInterface({ input: process.stdin });
+  const lines: string[] = [];
+  let waitForLine: (() => void) | undefined;
+  let closed = false;
+  let signal: NodeJS.Signals | undefined;
+  const wake = () => {
+    waitForLine?.();
+    waitForLine = undefined;
+  };
+  const interrupt = (receivedSignal: NodeJS.Signals) => {
+    signal = receivedSignal;
+    closed = true;
+    readline.close();
+    wake();
+  };
+  const onSigint = () => interrupt('SIGINT');
+  const onSigterm = () => interrupt('SIGTERM');
+
+  process.once('SIGINT', onSigint);
+  process.once('SIGTERM', onSigterm);
+  readline.on('line', (line) => {
+    lines.push(line);
+    wake();
+  });
+  readline.on('close', () => {
+    closed = true;
+    wake();
+  });
+
+  return {
+    prompt: async (message) => {
+      process.stdout.write(message);
+      while (lines.length === 0 && !closed) {
+        await new Promise<void>((resolve) => {
+          waitForLine = resolve;
+        });
+      }
+      return lines.shift() ?? '';
+    },
+    close: () => {
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
+      readline.close();
+    },
+    interrupted: () => signal,
+  };
+}
+
+function requirePrompt(io: Pick<CliIo, 'prompt'>): Required<Pick<CliIo, 'prompt'>> {
+  if (!io.prompt) throw new Error('Interactive input is unavailable');
+  return { prompt: io.prompt };
+}
+
+function packagesFromSpecs(specs: string[]): PackageEntry[] {
+  const packages = new Map<string, string[]>();
+
+  for (const spec of specs) {
+    const separator = spec.lastIndexOf('@');
+    const name = spec.slice(0, separator);
+    const version = spec.slice(separator + 1);
+    if (separator <= 0 || !name || !version) {
+      throw new Error(`--package must use package@exact-version: ${spec}`);
+    }
+    const versions = packages.get(name) ?? [];
+    if (!versions.includes(version)) versions.push(version);
+    packages.set(name, versions);
+  }
+
+  if (packages.size === 0) throw new Error('At least one --package is required with --source');
+  return [...packages].map(([name, versions]) => ({ name, versions }));
+}
+
+async function askForSourceUrl(io: Required<Pick<CliIo, 'prompt'>>): Promise<string> {
+  const source = (await io.prompt('Advisory source URL: ')).trim();
+  const slug = incidentSlug(source);
+  if (!slug) throw new Error('A source URL with a path slug is required');
+  return source;
+}
+
+async function askForPackages(
+  io: Required<Pick<CliIo, 'prompt'>>,
+): Promise<PackageEntry[]> {
+  const packages: PackageEntry[] = [];
+
+  do {
+    const name = (await io.prompt('Compromised package name: ')).trim();
+    if (!name) throw new Error('A package name is required');
+
+    const versions = (await io.prompt('Exact compromised version(s), comma-separated: '))
+      .split(',')
+      .map((version) => version.trim())
+      .filter(Boolean);
+    if (versions.length === 0) throw new Error('At least one exact version is required');
+    packages.push({ name, versions: [...new Set(versions)] });
+  } while (/^y(es)?$/i.test((await io.prompt('Add another package? [y/N]: ')).trim()));
+
+  return packages;
+}
+
+function defaultManifest(): string {
+  const workspaceManifest = path.resolve(workspaceManifestFilename);
+  return existsSync(workspaceManifest) ? workspaceManifest : bundledManifest;
+}
+
+function incidentSlug(source: string): string {
+  let url: URL;
+  try {
+    url = new URL(source);
+  } catch {
+    return '';
+  }
+
+  const segment = url.pathname.split('/').filter(Boolean).at(-1);
+  return segment?.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') ?? '';
+}
+
 function printScanResults(results: FileScanResult[], io: CliIo): void {
   for (const result of results) {
     if (result.fallbackWarning) io.stderr(`[WARN] ${result.file}: ${result.fallbackWarning}`);
@@ -151,10 +334,22 @@ function printScanResults(results: FileScanResult[], io: CliIo): void {
 
 function parseArguments(
   argv: string[],
-): { action: 'scan'; options: CliOptions } | { action: 'help' } | { action: 'version' } {
-  const options: CliOptions = {
+):
+  | { action: 'scan'; options: ScanOptions }
+  | { action: 'init'; options: InitOptions }
+  | { action: 'help'; topic?: 'init' }
+  | { action: 'version' } {
+  if (argv[0] === 'init') return parseInitArguments(argv.slice(1));
+  if (argv[0] === 'help') {
+    if (argv.length === 1) return { action: 'help' };
+    if (argv.length === 2 && argv[1] === 'init') return { action: 'help', topic: 'init' };
+    throw new Error(`Unknown help topic: ${argv[1] ?? ''}`);
+  }
+  if (argv.includes('-h') || argv.includes('--help')) return { action: 'help' };
+  if (argv.includes('-v') || argv.includes('--version')) return { action: 'version' };
+
+  const options: ScanOptions = {
     root: defaultScanRoot(),
-    manifest: defaultManifest,
     cacheFile: defaultCacheFile(),
     useCache: true,
     clearCache: false,
@@ -162,8 +357,6 @@ function parseArguments(
 
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
-    if (argument === '-h' || argument === '--help') return { action: 'help' };
-    if (argument === '-v' || argument === '--version') return { action: 'version' };
     if (argument === '--no-cache') {
       options.useCache = false;
       continue;
@@ -172,7 +365,6 @@ function parseArguments(
       options.clearCache = true;
       continue;
     }
-
     if (argument === '--root' || argument === '--manifest' || argument === '--cache-file') {
       const value = argv[index + 1];
       if (!value) throw new Error(`${argument} requires a value`);
@@ -182,11 +374,41 @@ function parseArguments(
       if (argument === '--cache-file') options.cacheFile = path.resolve(value);
       continue;
     }
-
     throw new Error(`Unknown argument: ${argument}`);
   }
 
   return { action: 'scan', options };
+}
+
+function parseInitArguments(
+  argv: string[],
+): { action: 'init'; options: InitOptions } | { action: 'help'; topic?: 'init' } {
+  if (argv.includes('-h') || argv.includes('--help')) return { action: 'help', topic: 'init' };
+  const options: InitOptions = { output: path.resolve(workspaceManifestFilename), force: false, packageSpecs: [] };
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    if (argument === '--force') {
+      options.force = true;
+      continue;
+    }
+    if (argument === '--output' || argument === '--source' || argument === '--package') {
+      const value = argv[index + 1];
+      if (!value) throw new Error(`${argument} requires a value`);
+      index += 1;
+      if (argument === '--output') options.output = path.resolve(value);
+      if (argument === '--source') options.source = value;
+      if (argument === '--package') options.packageSpecs.push(value);
+      continue;
+    }
+    throw new Error(`Unknown init argument: ${argument}`);
+  }
+
+  if ((options.source === undefined) !== (options.packageSpecs.length === 0)) {
+    throw new Error('Use --source and at least one --package together');
+  }
+
+  return { action: 'init', options };
 }
 
 function defaultScanRoot(): string {
@@ -201,18 +423,61 @@ function phase(io: CliIo, message: string): void {
   io.stdout(`\n[${timestamp}] ${message}`);
 }
 
-function helpText(): string {
+function helpText(topic?: 'init'): string {
+  if (topic === 'init') {
+    return `Usage: npm-compromise-scan init [options]
+
+Create a Workspace Manifest for package/version pairs from an advisory.
+
+Prompts:
+  Advisory source URL     Required; used to derive the incident ID
+  Compromised package     Package name to match
+  Exact version(s)        One or more comma-separated versions
+
+Options:
+  --output <path>      Output file (default: ./${workspaceManifestFilename})
+  --force              Overwrite an existing output file
+  --source <url>       Create non-interactively from this advisory URL
+  --package <name@version>
+                        Add an exact compromised version; repeat as needed
+
+Examples:
+  npm-compromise-scan init
+  npm-compromise-scan init --source https://example.com/advisory \\
+    --package keyv@6.0.0 --package @cacheable/memory@2.2.1
+  npm-compromise-scan --root ./my-project
+
+The scan uses ./${workspaceManifestFilename} in the current directory unless
+--manifest <path> is provided.`;
+  }
+
   return `Usage: npm-compromise-scan [options]
+       npm-compromise-scan init [options]
 
 Scans package manifests and npm, Yarn, pnpm, and Bun lockfiles for exact
 package/version pairs from a vulnerability manifest.
 
-Options:
+Scan options:
   --root <path>        Scan root (default: current system drive/root)
   --manifest <path>    Custom vulnerability manifest
   --cache-file <path>  Custom candidate inventory cache
   --no-cache           Disable reading and writing the inventory cache
   --clear-cache        Clear the inventory cache before scanning
+
+Init options:
+  --output <path>      Workspace Manifest output (default: ./${workspaceManifestFilename})
+  --force              Overwrite an existing output file
+
+Without --manifest, a ./${workspaceManifestFilename} in the current directory
+replaces the bundled manifest.
+
+Getting started:
+  npm-compromise-scan help init   Create a Workspace Manifest interactively
+  npm-compromise-scan init        Create it now
+  npm-compromise-scan --root .    Scan the current project
+
+General options:
+  help [init]          Show general or init-specific help
   -h, --help           Show help
   -v, --version        Show version
 

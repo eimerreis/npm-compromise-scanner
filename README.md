@@ -39,6 +39,33 @@ Linux    $XDG_CACHE_HOME/npm-compromise-scanner/inventory.json
 Windows  %LOCALAPPDATA%\npm-compromise-scanner\cache\inventory.json
 ```
 
+## Workspace Manifest
+
+Create a local manifest interactively:
+
+```bash
+npm-compromise-scan init
+```
+
+This writes `./npm-compromise-scanner.json`. A scan run from that directory uses it instead of the bundled manifest. Use `--output <path>` to choose another location, and `--force` to replace an existing output file.
+
+Coding agents and scripts can create the same manifest without prompts after extracting exact pairs from an advisory:
+
+```bash
+npm-compromise-scan init \
+  --source https://example.com/advisory \
+  --package keyv@6.0.0 \
+  --package @cacheable/memory@2.2.1
+```
+
+Repeat `--package` for each affected pair. Scoped packages are supported.
+
+```bash
+npm-compromise-scan --manifest ./other-manifest.json
+```
+
+An explicit `--manifest` always takes precedence over the Workspace Manifest.
+
 ## Custom manifest
 
 ```json
