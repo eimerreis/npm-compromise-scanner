@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Setup npm for trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Detect pending changesets
+        id: detect
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(.changeset/*.md)
+          count=0
+          for file in "${files[@]}"; do
+            if [[ "$(basename "$file")" != "README.md" ]]; then
+              count=$((count + 1))
+            fi
+          done
+
+          if ((count > 0)); then
+            echo "has_changesets=true" >> "$GITHUB_OUTPUT"
+            echo "Found $count changeset file(s)."
+          else
+            echo "has_changesets=false" >> "$GITHUB_OUTPUT"
+            echo "No changesets found. Skipping release."
+          fi
+
+      - name: Verify
+        if: steps.detect.outputs.has_changesets == 'true'
+        run: npm test && npm run check && npm run build
+
+      - name: Version package with changesets
+        if: steps.detect.outputs.has_changesets == 'true'
+        run: npm run version-packages
+
+      - name: Publish to npm via trusted publishing
+        if: steps.detect.outputs.has_changesets == 'true'
+        run: npm run release
+
+      - name: Commit version changes
+        id: commit
+        if: steps.detect.outputs.has_changesets == 'true'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "did_commit=false" >> "$GITHUB_OUTPUT"
+            echo "No version changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: version packages"
+          git push
+          echo "did_commit=true" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release changelog
+        id: changelog
+        if: steps.detect.outputs.has_changesets == 'true' && steps.commit.outputs.did_commit == 'true'
+        shell: bash
+        run: |
+          node --input-type=module <<'EOF'
+          import fs from 'node:fs';
+
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const version = pkg.version;
+          const changelog = fs.readFileSync('CHANGELOG.md', 'utf8');
+          const heading = `## ${version}`;
+          const headingIndex = changelog.indexOf(heading);
+
+          if (headingIndex === -1) {
+            throw new Error(`Could not find ${heading} in CHANGELOG.md`);
+          }
+
+          const remainder = changelog.slice(headingIndex + heading.length);
+          const nextHeadingIndex = remainder.indexOf('\n## ');
+          const entryBody = (nextHeadingIndex === -1 ? remainder : remainder.slice(0, nextHeadingIndex)).trimEnd();
+          const notes = `${heading}${entryBody ? `\n${entryBody}` : ''}\n`;
+
+          fs.writeFileSync('release-notes.md', notes);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${version}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `tag=v${version}\n`);
+          EOF
+
+      - name: Create GitHub release
+        if: steps.detect.outputs.has_changesets == 'true' && steps.commit.outputs.did_commit == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "${{ steps.changelog.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.changelog.outputs.tag }} already exists. Skipping."
+            exit 0
+          fi
+
+          gh release create "${{ steps.changelog.outputs.tag }}" \
+            --title "${{ steps.changelog.outputs.tag }}" \
+            --notes-file release-notes.md \
+            --target "${{ steps.commit.outputs.commit_sha }}"

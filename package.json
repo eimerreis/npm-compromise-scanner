@@ -41,12 +41,16 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "changeset": "changeset",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/bin.ts",
     "prepack": "npm run build",
-    "test": "tsx --test"
+    "release": "npm run build && changeset publish",
+    "test": "tsx --test",
+    "version-packages": "changeset version"
   },
   "devDependencies": {
+    "@changesets/cli": "^2.31.1",
     "@types/node": "^24.0.0",
     "tsx": "^4.23.7",
     "typescript": "^7.0.2"

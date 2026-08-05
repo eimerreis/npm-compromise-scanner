@@ -78,3 +78,16 @@ npm run check
 npm run build
 npm run dev -- --root /path/to/scan
 ```
+
+## Releasing
+
+Record the release intent and push it to `main`:
+
+```bash
+npm run changeset
+git add .changeset
+git commit -m "chore: add release changeset"
+git push
+```
+
+The release workflow verifies the package, applies the pending changeset, publishes through npm trusted publishing, commits the version update, and creates the corresponding GitHub release.
