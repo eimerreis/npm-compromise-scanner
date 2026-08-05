@@ -14,6 +14,15 @@ The default scan root is `/` on macOS/Linux and the system drive on Windows. Ful
 sudo npx @eimerreis/npm-compromise-scanner
 ```
 
+If npm reports `ENOVERSIONS` for this package shortly after a release, check
+the npm `min-release-age` setting. A value such as `3` hides versions published
+within the last three days, so npm cannot select the newly published package.
+Wait for that period or explicitly disable the delay for this command:
+
+```bash
+npx --min-release-age=0 @eimerreis/npm-compromise-scanner --root /path/to/scan
+```
+
 Options:
 
 ```text
