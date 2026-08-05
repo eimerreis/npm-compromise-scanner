@@ -1,6 +1,6 @@
 {
   "name": "@eimerreis/npm-compromise-scanner",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Cross-platform CLI for finding known compromised npm package versions on a machine.",
   "type": "module",
   "author": "Moritz Frölich <mail@moritzfroelich.de>",
